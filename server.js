@@ -8,14 +8,12 @@ app.use(express.json());
 
 console.log('CLIENT_ID:', process.env.GOOGLE_CLIENT_ID);
 
-// ── Google Calendar ──────────────────────────────────────────────
 const oauth2Client = new google.auth.OAuth2(
   process.env.GOOGLE_CLIENT_ID,
   process.env.GOOGLE_CLIENT_SECRET,
   process.env.REDIRECT_URI
 );
 
-// Step 1: redirect user to Google login
 app.get('/auth/google', (req, res) => {
   const url = oauth2Client.generateAuthUrl({
     access_type: 'offline',
@@ -27,7 +25,6 @@ app.get('/auth/google', (req, res) => {
   res.redirect(url);
 });
 
-// Step 2: Google sends back a code, swap for tokens
 app.get('/auth/callback', async (req, res) => {
   const { code } = req.query;
   const { tokens } = await oauth2Client.getToken(code);
@@ -36,7 +33,6 @@ app.get('/auth/callback', async (req, res) => {
   res.send(`<h2 style="font-family:sans-serif;padding:40px">Connected to Google Calendar. You can close this tab.</h2>`);
 });
 
-// Get busy times for next 7 days
 app.get('/availability', async (req, res) => {
   if (!app.locals.tokens) {
     return res.json({ availability: 'Not connected to Google Calendar yet.' });
@@ -59,10 +55,11 @@ app.get('/availability', async (req, res) => {
       : events.map(e => {
           const start = new Date(e.start.dateTime || e.start.date).toLocaleString('en-US', {
             weekday: 'short', month: 'short', day: 'numeric',
-            hour: 'numeric', minute: '2-digit', timeZoneName: 'short'
+            hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+            timeZone: 'America/Los_Angeles'
           });
           const end = new Date(e.end.dateTime || e.end.date).toLocaleString('en-US', {
-            hour: 'numeric', minute: '2-digit'
+            hour: 'numeric', minute: '2-digit', timeZone: 'America/Los_Angeles'
           });
           return `${e.summary || 'Busy'}: ${start} to ${end}`;
         }).join('\n');
@@ -72,33 +69,44 @@ app.get('/availability', async (req, res) => {
   }
 });
 
-// Book a call: create calendar event + send text via Twilio
 app.post('/book', async (req, res) => {
-  const { leadName, dateTime, durationMinutes, situation } = req.body;
+  const { leadName, dateTime, timezone, durationMinutes, situation } = req.body;
 
   if (!app.locals.tokens) {
     return res.status(400).json({ error: 'Not connected to Google Calendar.' });
   }
 
   try {
-    // 1. Create calendar event
     oauth2Client.setCredentials(app.locals.tokens);
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
 
-    const start = new Date(dateTime);
-    const end = new Date(start.getTime() + (durationMinutes || 30) * 60 * 1000);
+    // Use the lead's timezone to interpret the datetime correctly
+    const tz = timezone || 'America/Los_Angeles';
+
+    // dateTime comes in as "2026-04-04T11:00:00" (local time in lead's tz)
+    // We pass it directly to Google Calendar with the timezone — Google handles conversion
+    const startLocal = dateTime.includes('Z') ? dateTime : dateTime.replace(' ', 'T');
+    const startDate = new Date(startLocal);
+    const endDate = new Date(startDate.getTime() + (durationMinutes || 30) * 60 * 1000);
+
+    // Format for display in PST (Ian's timezone)
+    const startFormatted = startDate.toLocaleString('en-US', {
+      weekday: 'short', month: 'short', day: 'numeric',
+      hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+      timeZone: tz
+    });
 
     const event = await calendar.events.insert({
       calendarId: 'primary',
       requestBody: {
         summary: `Strategy Call w/ ${leadName}`,
-        description: `Lead situation: ${situation}\n\nBooked via IAN.DM`,
-        start: { dateTime: start.toISOString() },
-        end: { dateTime: end.toISOString() },
+        description: `Lead situation: ${situation}\n\nBooked via IAN.DM\nLead timezone: ${tz}`,
+        start: { dateTime: startDate.toISOString(), timeZone: tz },
+        end: { dateTime: endDate.toISOString(), timeZone: tz },
       },
     });
 
-    // 2. Send text via Twilio
+    // Send text via Twilio
     const twilioSid = process.env.TWILIO_ACCOUNT_SID;
     const twilioAuth = process.env.TWILIO_AUTH_TOKEN;
     const twilioFrom = process.env.TWILIO_FROM;
@@ -106,10 +114,6 @@ app.post('/book', async (req, res) => {
 
     let textSent = false;
     if (twilioSid && twilioAuth && twilioFrom && twilioTo) {
-      const startFormatted = start.toLocaleString('en-US', {
-        weekday: 'short', month: 'short', day: 'numeric',
-        hour: 'numeric', minute: '2-digit', timeZoneName: 'short'
-      });
       const msgBody = `IAN.DM: call booked\nLead: ${leadName}\nTime: ${startFormatted}\nSituation: ${situation}`;
       const twilioRes = await fetch(
         `https://api.twilio.com/2010-04-01/Accounts/${twilioSid}/Messages.json`,
@@ -122,16 +126,18 @@ app.post('/book', async (req, res) => {
           body: new URLSearchParams({ From: twilioFrom, To: twilioTo, Body: msgBody }),
         }
       );
+      const twilioData = await twilioRes.json();
       textSent = twilioRes.ok;
+      console.log('Twilio response:', JSON.stringify(twilioData));
     }
 
-    res.json({ success: true, eventId: event.data.id, eventLink: event.data.htmlLink, textSent });
+    res.json({ success: true, eventId: event.data.id, eventLink: event.data.htmlLink, textSent, startFormatted });
   } catch (err) {
+    console.error('Book error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Proxy Anthropic API calls
 app.post('/chat', async (req, res) => {
   const { messages, system } = req.body;
   try {
