@@ -10,14 +10,6 @@ console.log('CLIENT_ID:', process.env.GOOGLE_CLIENT_ID);
 
 const IAN_TZ = 'America/Los_Angeles';
 
-// PST offset in ms (-7 hours standard, -8 PDT — use Intl to get the real offset)
-function getPSTOffset() {
-  const now = new Date();
-  const pstString = now.toLocaleString('en-US', { timeZone: IAN_TZ, hour12: false });
-  const utcString = now.toLocaleString('en-US', { timeZone: 'UTC', hour12: false });
-  return (new Date(utcString) - new Date(pstString));
-}
-
 function fmtInTZ(date, tz) {
   return new Date(date).toLocaleString('en-US', {
     weekday: 'short', month: 'short', day: 'numeric',
@@ -51,34 +43,69 @@ app.get('/auth/callback', async (req, res) => {
   res.send(`<h2 style="font-family:sans-serif;padding:40px">Connected to Google Calendar. You can close this tab.</h2>`);
 });
 
-// Return current date/time in PST — used by simulator so AI gets the right date
+// Returns today's PST date AND an explicit map of the next 7 days
+// so the AI never has to calculate dates itself
 app.get('/now', (req, res) => {
   const now = new Date();
-  // Get each date component in PST
-  const parts = new Intl.DateTimeFormat('en-US', {
+
+  // Get today's date components in PST using Intl
+  const fmt = new Intl.DateTimeFormat('en-US', {
     timeZone: IAN_TZ,
-    weekday: 'long',
-    year: 'numeric',
-    month: 'long',
-    day: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    hour12: true
-  }).formatToParts(now);
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    weekday: 'long', hour: 'numeric', minute: '2-digit', hour12: true
+  });
 
+  const parts = fmt.formatToParts(now);
   const get = type => parts.find(p => p.type === type)?.value || '';
-  const pstStr = `${get('weekday')}, ${get('month')} ${get('day')}, ${get('year')} at ${get('hour')}:${get('minute')} ${get('dayPeriod')} PST`;
 
-  // Also return ISO components in PST for date calculation
-  const pstDate = new Date(now.toLocaleString('en-US', { timeZone: IAN_TZ }));
+  const year = parseInt(get('year'));
+  const month = parseInt(get('month'));
+  const day = parseInt(get('day'));
+  const weekday = get('weekday');
+  const hour = get('hour');
+  const minute = get('minute');
+  const dayPeriod = get('dayPeriod');
+
+  const todayStr = `${weekday}, ${get('month')}/${day}/${year} at ${hour}:${minute} ${dayPeriod} PST`;
+
+  // Build explicit next 7 days map
+  // We do this by iterating from today in PST
+  const WEEKDAYS = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+  const MONTHS = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+
+  const nextDays = [];
+  for (let i = 0; i <= 7; i++) {
+    // Create a date that's i days from now, interpreted in PST
+    const d = new Date(now);
+    d.setUTCHours(d.getUTCHours() + i * 24);
+
+    const dp = new Intl.DateTimeFormat('en-US', {
+      timeZone: IAN_TZ,
+      year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'long'
+    }).formatToParts(d);
+
+    const dget = type => dp.find(p => p.type === type)?.value || '';
+    const dYear = parseInt(dget('year'));
+    const dMonth = parseInt(dget('month'));
+    const dDay = parseInt(dget('day'));
+    const dWeekday = dget('weekday');
+
+    const pad = n => String(n).padStart(2, '0');
+    nextDays.push({
+      label: i === 0 ? 'today' : i === 1 ? 'tomorrow' : dWeekday,
+      weekday: dWeekday,
+      date: `${dYear}-${pad(dMonth)}-${pad(dDay)}`,
+      display: `${dWeekday} ${MONTHS[dMonth-1]} ${dDay}`
+    });
+  }
+
+  console.log('Now endpoint called. Today PST:', todayStr, 'Next days:', JSON.stringify(nextDays));
 
   res.json({
-    now: pstStr,
-    iso: now.toISOString(),
-    pstYear: pstDate.getFullYear(),
-    pstMonth: pstDate.getMonth() + 1,
-    pstDay: pstDate.getDate(),
-    pstWeekday: get('weekday')
+    now: todayStr,
+    today: { year, month, day, weekday },
+    nextDays,
+    iso: now.toISOString()
   });
 });
 
@@ -139,30 +166,25 @@ app.post('/book', async (req, res) => {
     const tz = timezone || IAN_TZ;
 
     // dateTime is "YYYY-MM-DDTHH:MM:SS" in the lead's local timezone
-    // We need to convert it to UTC properly using the timezone
-    // Strategy: interpret the datetime string AS IF it's in the given timezone
-    const localDateStr = dateTime.includes('T') ? dateTime : dateTime.replace(' ', 'T');
-
-    // Build a proper UTC date by using Intl to get the offset
-    // Parse the local time parts
-    const [datePart, timePart] = localDateStr.split('T');
+    // Convert to UTC properly
+    const localStr = dateTime.includes('T') ? dateTime : dateTime.replace(' ', 'T');
+    const [datePart, timePart] = localStr.split('T');
     const [year, month, day] = datePart.split('-').map(Number);
-    const [hour, minute, second] = (timePart || '00:00:00').split(':').map(Number);
+    const [hour, minute, sec] = (timePart || '00:00:00').split(':').map(Number);
 
-    // Create a reference date in the target timezone to find the UTC offset
-    const refDate = new Date(`${datePart}T${timePart || '00:00:00'}Z`);
-    const tzString = refDate.toLocaleString('en-US', { timeZone: tz, hour12: false });
-    const utcString = refDate.toLocaleString('en-US', { timeZone: 'UTC', hour12: false });
-    const offsetMs = new Date(utcString) - new Date(tzString);
+    // Find UTC offset for this timezone at this date
+    const probe = new Date(`${datePart}T${timePart || '12:00:00'}Z`);
+    const localFormatted = probe.toLocaleString('en-US', { timeZone: tz, hour12: false });
+    const utcFormatted = probe.toLocaleString('en-US', { timeZone: 'UTC', hour12: false });
+    const offsetMs = new Date(utcFormatted) - new Date(localFormatted);
 
-    // Apply offset to get UTC
-    const localMs = Date.UTC(year, month - 1, day, hour, minute, second || 0);
+    const localMs = Date.UTC(year, month - 1, day, hour, minute, sec || 0);
     const utcMs = localMs + offsetMs;
     const startDate = new Date(utcMs);
     const endDate = new Date(startDate.getTime() + (durationMinutes || 30) * 60 * 1000);
 
     const startFormatted = fmtInTZ(startDate, IAN_TZ);
-    console.log('Booking:', { localInput: localDateStr, tz, utc: startDate.toISOString(), displayPST: startFormatted });
+    console.log('Booking UTC:', startDate.toISOString(), '-> PST display:', startFormatted);
 
     const event = await calendar.events.insert({
       calendarId: 'primary',
@@ -174,7 +196,7 @@ app.post('/book', async (req, res) => {
       },
     });
 
-    console.log('Calendar event created:', event.data.id, startFormatted);
+    console.log('Event created:', event.data.id, startFormatted);
 
     // Twilio
     const twilioSid = process.env.TWILIO_ACCOUNT_SID;
@@ -187,8 +209,6 @@ app.post('/book', async (req, res) => {
 
     if (twilioSid && twilioAuth && twilioFrom && twilioTo) {
       const msgBody = `IAN.DM: call booked\nLead: ${leadName}\nTime: ${startFormatted}\nSituation: ${situation}`;
-      console.log('Sending text:', { to: twilioTo, from: twilioFrom });
-
       const twilioRes = await fetch(
         `https://api.twilio.com/2010-04-01/Accounts/${twilioSid}/Messages.json`,
         {
@@ -201,16 +221,14 @@ app.post('/book', async (req, res) => {
         }
       );
       const twilioData = await twilioRes.json();
-      console.log('Twilio response:', JSON.stringify(twilioData));
+      console.log('Twilio:', JSON.stringify(twilioData));
       textSent = twilioRes.ok && !twilioData.error_code;
       if (!textSent) twilioError = `${twilioData.error_code}: ${twilioData.message || twilioData.error_message}`;
-    } else {
-      console.log('Twilio vars missing:', { sid: !!twilioSid, auth: !!twilioAuth, from: twilioFrom, to: twilioTo });
     }
 
     res.json({ success: true, eventId: event.data.id, startFormatted, textSent, twilioError });
   } catch (err) {
-    console.error('Book error:', err.message, err.stack);
+    console.error('Book error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
